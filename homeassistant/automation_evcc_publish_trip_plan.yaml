@@ -20,6 +20,14 @@
 # trip, so a limit set by hand holds until the charge that used it is done.
 # Never lowered while charging. Every limit write is read back from the car
 # before it is recorded.
+#
+# Limit writes: the car is woken first and a write is tried up to three
+# times. When evcc contacts the car (it does after every plan change, and
+# polls it while connected), the car drops Home Assistant's signed command
+# session; the next command then fails with "Vehicle did not recognize the
+# key" and the one after that works. Seen 8 Oct 2026. The limit is also
+# written before the plan goes to evcc, so this run's own publish does not
+# get in between.
 
 alias: evcc publish trip plan
 description: >-
@@ -49,11 +57,12 @@ actions:
   - variables:
       vehicle: <evcc_vehicle>
       car_limit_entity: number.<car>_charge_limit
+      car_wake_button: button.<car>_wake
       normal_limit: 80
       car_limit: "{{ states('number.<car>_charge_limit') | float(0) }}"
       car_soc: "{{ states('sensor.<car>_battery_level') | float(0) }}"
       charging_state: "{{ states('sensor.<car>_charging') }}"
-      fired_by: "{{ trigger.id if trigger is defined else 'manual' }}"
+      fired_by: "{{ (trigger | default({})).get('id') or 'manual' }}"
       plan_entity: sensor.ev_trip_planner_plan
       plan_kind: "{{ state_attr(plan_entity, 'kind') }}"
       soc_raw: "{{ states(plan_entity) | float(0) }}"
@@ -69,66 +78,63 @@ actions:
       notify_service: >-
         {{ notify_raw if notify_raw.startswith('notify.')
            else 'notify.mobile_app_<your_phone>' }}
-  - alias: Publish or clear evcc plan
-    choose:
-      - conditions: "{{ idle }}"
-        sequence:
-          - action: rest_command.evcc_delete_soc_plan
-            data:
-              vehicle: "{{ vehicle }}"
-            response_variable: resp
-            continue_on_error: true
-    default:
-      - action: rest_command.evcc_set_soc_plan
-        data:
-          vehicle: "{{ vehicle }}"
-          soc: "{{ soc }}"
-          time: "{{ plan_time }}"
-        response_variable: resp
-        continue_on_error: true
-  - if:
-      - condition: template
-        value_template: "{{ resp is not defined or resp.status >= 300 }}"
-    then:
-      - action: persistent_notification.create
-        data:
-          notification_id: evcc_plan_publish
-          title: evcc plan not updated
-          message: >-
-            Could not {{ 'clear' if idle else 'set' }} the charging plan in evcc
-            ({{ resp.status if resp is defined else 'no response' }}).
   - alias: Car charge limit
     choose:
       - alias: Raise for an upcoming trip
         conditions: "{{ raise_needed and car_limit < soc }}"
         sequence:
-          - action: number.set_value
+          - alias: Wake the car, the limit read above may be stale
+            action: button.press
             target:
-              entity_id: "{{ car_limit_entity }}"
-            data:
-              value: "{{ soc }}"
+              entity_id: "{{ car_wake_button }}"
             continue_on_error: true
-          - alias: Wait for the car to confirm
-            wait_template: "{{ states(car_limit_entity) | float(0) >= soc }}"
-            timeout: "00:00:30"
-            continue_on_timeout: true
+          - delay: "00:00:20"
+          - variables:
+              limit_awake: "{{ states(car_limit_entity) | float(0) }}"
+          - alias: Write until the car confirms, at most three tries
+            repeat:
+              while:
+                - condition: template
+                  value_template: >-
+                    {{ states(car_limit_entity) | float(0) < soc
+                       and repeat.index <= 3 }}
+              sequence:
+                - action: number.set_value
+                  target:
+                    entity_id: "{{ car_limit_entity }}"
+                  data:
+                    value: "{{ soc }}"
+                  continue_on_error: true
+                - wait_template: "{{ states(car_limit_entity) | float(0) >= soc }}"
+                  timeout: "00:00:15"
+                  continue_on_timeout: true
           - if:
               - condition: template
-                value_template: "{{ wait.completed }}"
+                value_template: "{{ states(car_limit_entity) | float(0) >= soc }}"
             then:
-              - action: input_boolean.turn_on
-                target:
-                  entity_id: input_boolean.evcc_car_limit_raised
               - action: persistent_notification.dismiss
                 data:
                   notification_id: evcc_car_limit
-              - action: "{{ notify_service }}"
-                data:
-                  title: Tesla charge limit raised
-                  message: >-
-                    Your next trip needs {{ soc }}%, so the charge limit is raised
-                    until then. It goes back to {{ normal_limit }}% afterwards.
-                continue_on_error: true
+              - alias: >-
+                  Record and announce only a raise HA made. A limit already high
+                  enough once the car woke (set by hand) stays a human's.
+                if:
+                  - condition: template
+                    value_template: "{{ limit_awake < soc }}"
+                  - condition: state
+                    entity_id: input_boolean.evcc_car_limit_raised
+                    state: "off"
+                then:
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: input_boolean.evcc_car_limit_raised
+                  - action: "{{ notify_service }}"
+                    data:
+                      title: Tesla charge limit raised
+                      message: >-
+                        Your next trip needs {{ soc }}%, so the charge limit is raised
+                        until then. It goes back to {{ normal_limit }}% afterwards.
+                    continue_on_error: true
             else:
               - action: persistent_notification.create
                 data:
@@ -154,19 +160,31 @@ actions:
                  or (fired_by == 'charge_ended' and car_soc >= car_limit - 1)
                  or (booked_trip and soc <= normal_limit) }}
         sequence:
-          - action: number.set_value
+          - action: button.press
             target:
-              entity_id: "{{ car_limit_entity }}"
-            data:
-              value: "{{ normal_limit }}"
+              entity_id: "{{ car_wake_button }}"
             continue_on_error: true
-          - alias: Wait for the car to confirm
-            wait_template: "{{ states(car_limit_entity) | float(999) <= normal_limit }}"
-            timeout: "00:00:30"
-            continue_on_timeout: true
+          - delay: "00:00:20"
+          - alias: Write until the car confirms, at most three tries
+            repeat:
+              while:
+                - condition: template
+                  value_template: >-
+                    {{ states(car_limit_entity) | float(999) > normal_limit
+                       and repeat.index <= 3 }}
+              sequence:
+                - action: number.set_value
+                  target:
+                    entity_id: "{{ car_limit_entity }}"
+                  data:
+                    value: "{{ normal_limit }}"
+                  continue_on_error: true
+                - wait_template: "{{ states(car_limit_entity) | float(999) <= normal_limit }}"
+                  timeout: "00:00:15"
+                  continue_on_timeout: true
           - if:
               - condition: template
-                value_template: "{{ wait.completed }}"
+                value_template: "{{ states(car_limit_entity) | float(999) <= normal_limit }}"
             then:
               - alias: Only tell them if a human raised it, not if we did
                 if:
@@ -196,3 +214,31 @@ actions:
                   message: >-
                     Could not lower the charge limit to {{ normal_limit }}% (car
                     asleep or unreachable). Retrying hourly.
+  - alias: Publish or clear evcc plan
+    choose:
+      - conditions: "{{ idle }}"
+        sequence:
+          - action: rest_command.evcc_delete_soc_plan
+            data:
+              vehicle: "{{ vehicle }}"
+            response_variable: resp
+            continue_on_error: true
+    default:
+      - action: rest_command.evcc_set_soc_plan
+        data:
+          vehicle: "{{ vehicle }}"
+          soc: "{{ soc }}"
+          time: "{{ plan_time }}"
+        response_variable: resp
+        continue_on_error: true
+  - if:
+      - condition: template
+        value_template: "{{ resp is not defined or resp.status >= 300 }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: evcc_plan_publish
+          title: evcc plan not updated
+          message: >-
+            Could not {{ 'clear' if idle else 'set' }} the charging plan in evcc
+            ({{ resp.status if resp is defined else 'no response' }}).
