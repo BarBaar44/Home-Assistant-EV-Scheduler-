@@ -386,6 +386,44 @@ async def test_charging_stop_alert(hass, ic, world, entry) -> None:
     assert float(state(hass, "plan").state) == 100
     stops = [s for s, d in world.notified if d["title"] == "Trip: charging stop needed"]
     assert stops == ["mobile_app_mar"]
+    # Delivered by push: nothing in the sidebar for the rest of the household.
+    assert not _sidebar(hass)
+
+
+async def test_alert_falls_back_to_sidebar_when_push_fails(
+    hass, ic, world, entry
+) -> None:
+    async def broken(call) -> None:
+        raise RuntimeError("phone gone")
+
+    hass.services.async_register("notify", "mobile_app_mar", broken)
+    world.waze_km = 600.0
+    await call(
+        hass,
+        "schedule",
+        user="u_mar",
+        start=wall(at(days=1, hour=9)),
+        place="Paris",
+        location="Paris",
+        geo="48.85,2.35",
+    )
+    notes = _sidebar(hass)
+    assert len(notes) == 1
+    note = next(iter(notes.values()))
+    assert note["title"] == "Trip: charging stop needed"
+    assert "notify.mobile_app_mar failed" in note["message"]
+
+
+def _sidebar(hass) -> dict:
+    from homeassistant.components import persistent_notification
+
+    return {
+        k: v
+        for k, v in persistent_notification._async_get_or_create_notifications(
+            hass
+        ).items()
+        if k.startswith("ev_trip_planner_")
+    }
 
 
 async def test_list_failure_keeps_plan(hass, ic, world, entry) -> None:

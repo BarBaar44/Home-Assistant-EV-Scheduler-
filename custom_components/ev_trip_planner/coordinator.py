@@ -16,6 +16,7 @@ from typing import Any
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.exceptions import ServiceNotFound
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -450,22 +451,31 @@ class TripPlannerCoordinator(DataUpdateCoordinator[PlannerData]):
     async def _alert(
         self, key: str, kind: str, title: str, message: str, notify: str
     ) -> None:
-        """Once per (occurrence, failure type): a persistent notification
-        plus a push to the trip's person."""
+        """Once per (occurrence, failure type): a push to the trip's person.
+
+        The trip's person is the only one who needs to see it, so the
+        sidebar (a persistent notification every HA user sees) is used only
+        when the push cannot be delivered. An alert never disappears
+        silently."""
         if self._cache["alerted"].get(key) == kind:
             return
         self._cache["alerted"][key] = kind
-        slug = "".join(ch if ch.isalnum() else "_" for ch in key)[-40:]
-        persistent_notification.async_create(
-            self.hass, message, title, f"{DOMAIN}_{slug}"
-        )
         domain, _, service = notify.partition(".")
         try:
+            if not self.hass.services.has_service(domain, service):
+                raise ServiceNotFound(domain, service)
             await self.hass.services.async_call(
                 domain, service, {"title": title, "message": message}, blocking=True
             )
-        except Exception as err:  # noqa: BLE001 - the notification is the fallback
+        except Exception as err:  # noqa: BLE001 - the sidebar is the fallback
             LOGGER.warning("Push via %s failed: %s", notify, err)
+            slug = "".join(ch if ch.isalnum() else "_" for ch in key)[-40:]
+            persistent_notification.async_create(
+                self.hass,
+                f"{message}\n\nThe push via {notify} failed: {err}",
+                title,
+                f"{DOMAIN}_{slug}",
+            )
 
     # ------------------------------------------------------------ status
 
